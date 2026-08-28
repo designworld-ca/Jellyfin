@@ -2,7 +2,7 @@
 
 """
 jellyfin_composers.py
-created by ChatGpt, tested by me
+
 REQUIREMENTS / BEHAVIOR
 -----------------------
 1. Scan MP3 files recursively and read the ID3 TCOM composer tag.
@@ -45,12 +45,22 @@ REQUIREMENTS / BEHAVIOR
 22. Retrieve full track/album DTOs through the Jellyfin user-scoped endpoint
     /Users/{userId}/Items/{itemId}; this avoids HTTP 400 responses seen with
     the bare GET /Items/{itemId} endpoint on Jellyfin 10.11.x.
-23. Requirements:
+23. After writing track Composer People, re-read every track and verify that
+    each expected composer is present with Type="Composer" and Role="Composer".
+24. If album.nfo files changed, run the Jellyfin library scan BEFORE the final
+    track/album People reconciliation, wait for the scan task to finish when
+    possible, and never run another library scan after that final reconciliation.
+25. Wikipedia lookup prioritizes musician-related candidates (musician,
+    songwriter, instrumentalist, conductor, etc.) before candidates that only
+    happen to match the name or explicitly use the word "composer".
+26. Legacy Wikimedia cache entries from older matching logic are re-resolved
+    when an Overview is still empty.
+27. Requirements:
        Python 3.10+
        pip install mutagen requests
 
 Typical environment:
-    JELLYFIN_URL defaults to http://127.0.0.1:8096
+    JELLYFIN_URL defaults to http://127.0.0.1:8091
     export JELLYFIN_API_KEY="your-api-key"
     export HOST_MUSIC_ROOT="/srv/media/music"
     export JELLYFIN_MUSIC_ROOT="/media/music"
@@ -99,13 +109,13 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 # JELLYFIN_MUSIC_ROOT:
 #   The same music directory as Jellyfin sees it inside the Docker container.
 #
-JELLYFIN_URL = "http://127.0.0.1:8096"
+JELLYFIN_URL = "http://127.0.0.1:8091"
 JELLYFIN_API_KEY = "PUT_YOUR_JELLYFIN_API_KEY_HERE"
 HOST_MUSIC_ROOT = "/path/on/ubuntu/to/music"
 JELLYFIN_MUSIC_ROOT = "/path/inside/jellyfin/container"
 WIKIMEDIA_CONTACT = "music@designworld.ca"
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 LOG = logging.getLogger("jellyfin-composers")
 
@@ -117,18 +127,40 @@ PROGRAM_DIR = Path(__file__).resolve().parent
 WIKI_CACHE_FILE = PROGRAM_DIR / "jellyfin-composer-wikipedia-cache.json"
 LOG_FILE = PROGRAM_DIR / "jellyfin-composers.log"
 
-COMPOSER_HINTS = (
-    "composer",
-    "musician",
-    "songwriter",
-    "conductor",
-    "pianist",
-    "violinist",
-    "music",
-    "singer",
-    "producer",
-    "arranger",
-)
+WIKI_LOOKUP_STRATEGY_VERSION = 2
+
+# Strongly prefer a page that describes the person as a musician or a
+# music-making professional. Many legitimate composers are primarily
+# described on Wikipedia as musicians, songwriters, instrumentalists,
+# singers, conductors, or producers rather than as "composer".
+MUSICIAN_PRIORITY_HINTS = {
+    "musician": 45,
+    "singer-songwriter": 40,
+    "songwriter": 38,
+    "multi-instrumentalist": 36,
+    "instrumentalist": 34,
+    "guitarist": 30,
+    "pianist": 30,
+    "violinist": 30,
+    "keyboardist": 28,
+    "drummer": 28,
+    "bassist": 28,
+    "singer": 26,
+    "vocalist": 26,
+    "conductor": 26,
+    "record producer": 24,
+    "music producer": 24,
+    "producer": 18,
+    "arranger": 22,
+}
+
+COMPOSER_PRIORITY_HINTS = {
+    "composer": 32,
+    "film score": 24,
+    "score composer": 30,
+    "classical music": 18,
+    "music": 8,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -443,64 +475,132 @@ class Wikipedia:
         )
 
         text = f"{title} {description} {excerpt}".casefold()
+        title_key = title.casefold()
+        composer_key = composer.casefold()
         score = 0
+        music_signal = False
 
-        if title.casefold() == composer.casefold():
+        if title_key == composer_key:
             score += 100
-        elif composer.casefold() in title.casefold():
+        elif composer_key in title_key:
             score += 50
 
-        for word in COMPOSER_HINTS:
-            if word in text:
-                score += 10
+        # Musician is deliberately weighted above "composer". This catches
+        # people whose Wikipedia lead describes them as a musician,
+        # songwriter, instrumentalist, singer, conductor, or producer.
+        for phrase, weight in MUSICIAN_PRIORITY_HINTS.items():
+            if phrase in text:
+                score += weight
+                music_signal = True
+
+        for phrase, weight in COMPOSER_PRIORITY_HINTS.items():
+            if phrase in text:
+                score += weight
+                music_signal = True
 
         if "disambiguation" in text:
-            score -= 100
+            score -= 200
+
+        # An exact-name hit with no music signal can easily be a different
+        # person with the same name. Keep it possible, but make it much less
+        # attractive than a clearly musical candidate.
+        if title_key == composer_key and not music_signal:
+            score -= 70
 
         return score
+
+    def _search_pages(
+        self,
+        query: str,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        response = self.request(
+            "GET",
+            WIKIPEDIA_SEARCH_URL,
+            params={
+                "q": query,
+                "limit": limit,
+            },
+        )
+        pages = response.json().get("pages", [])
+        return pages if isinstance(pages, list) else []
 
     def search_wikipedia_page(
         self,
         composer: str,
     ) -> dict[str, Any] | None:
-        response = self.request(
-            "GET",
-            WIKIPEDIA_SEARCH_URL,
-            params={
-                "q": f'"{composer}" composer',
-                "limit": 8,
-            },
-        )
+        # Search musician-first. Some composers are described by Wikipedia
+        # as musicians/songwriters rather than with the literal occupation
+        # "composer".
+        queries = [
+            f'"{composer}" musician',
+            f'"{composer}" songwriter',
+            f'"{composer}" composer',
+            composer,
+        ]
 
-        pages = response.json().get("pages", [])
+        by_title: dict[str, dict[str, Any]] = {}
 
-        if not pages:
-            response = self.request(
-                "GET",
-                WIKIPEDIA_SEARCH_URL,
-                params={
-                    "q": composer,
-                    "limit": 8,
-                },
-            )
-            pages = response.json().get("pages", [])
+        for query in queries:
+            pages = self._search_pages(query)
 
-        if not pages:
+            for page in pages:
+                title = str(page.get("title") or "").strip()
+                if not title:
+                    continue
+
+                key = title.casefold()
+                current = by_title.get(key)
+
+                if current is None:
+                    by_title[key] = page
+                    continue
+
+                # Keep whichever duplicate search result gives the stronger
+                # musical context/excerpt for ranking.
+                if self.score_result(composer, page) > self.score_result(
+                    composer,
+                    current,
+                ):
+                    by_title[key] = page
+
+            if by_title:
+                ranked = sorted(
+                    by_title.values(),
+                    key=lambda p: self.score_result(composer, p),
+                    reverse=True,
+                )
+
+                # Stop early once we have a very strong musician/composer hit.
+                if self.score_result(composer, ranked[0]) >= 120:
+                    break
+
+        if not by_title:
             return None
 
-        pages.sort(
+        pages = sorted(
+            by_title.values(),
             key=lambda p: self.score_result(composer, p),
             reverse=True,
         )
 
         best = pages[0]
+        best_score = self.score_result(composer, best)
 
-        if self.score_result(composer, best) <= 0:
+        if best_score <= 0:
             LOG.warning(
                 "Wikipedia candidates for %s were not convincing enough.",
                 composer,
             )
             return None
+
+        LOG.info(
+            "Wikipedia candidate selected for %s: %s (score=%d, description=%s)",
+            composer,
+            best.get("title") or "unknown",
+            best_score,
+            best.get("description") or "",
+        )
 
         return best
 
@@ -585,19 +685,27 @@ class Wikipedia:
 
         if key in self.cache:
             cached = self.cache[key]
+            strategy_version = int(cached.get("strategy_version") or 0)
 
-            if cached.get("status") == "not_found":
-                LOG.debug("Negative Wikimedia cache hit: %s", composer)
-                return None
+            if strategy_version >= WIKI_LOOKUP_STRATEGY_VERSION:
+                if cached.get("status") == "not_found":
+                    LOG.debug("Negative Wikimedia cache hit: %s", composer)
+                    return None
 
-            if cached.get("status") == "found":
-                LOG.debug(
-                    "Wikimedia cache hit: %s -> %s / %s",
+                if cached.get("status") == "found":
+                    LOG.debug(
+                        "Wikimedia cache hit: %s -> %s / %s",
+                        composer,
+                        cached.get("wikipedia_title"),
+                        cached.get("wikidata_id"),
+                    )
+                    return cached
+            else:
+                LOG.info(
+                    "Ignoring legacy Wikimedia cache entry for %s; "
+                    "re-running musician-priority matching.",
                     composer,
-                    cached.get("wikipedia_title"),
-                    cached.get("wikidata_id"),
                 )
-                return cached
 
         LOG.info("Searching Wikipedia for %s", composer)
 
@@ -607,6 +715,7 @@ class Wikipedia:
             self.cache[key] = {
                 "status": "not_found",
                 "composer": composer,
+                "strategy_version": WIKI_LOOKUP_STRATEGY_VERSION,
             }
             self.save_cache()
             return None
@@ -617,6 +726,7 @@ class Wikipedia:
             self.cache[key] = {
                 "status": "not_found",
                 "composer": composer,
+                "strategy_version": WIKI_LOOKUP_STRATEGY_VERSION,
             }
             self.save_cache()
             return None
@@ -628,6 +738,7 @@ class Wikipedia:
                 "status": "not_found",
                 "composer": composer,
                 "wikipedia_title": title,
+                "strategy_version": WIKI_LOOKUP_STRATEGY_VERSION,
             }
             self.save_cache()
             return None
@@ -641,6 +752,7 @@ class Wikipedia:
             "wikipedia_url": summary["wikipedia_url"],
             "wikidata_id": wikidata_id,
             "overview": summary["overview"],
+            "strategy_version": WIKI_LOOKUP_STRATEGY_VERSION,
         }
 
         self.cache[key] = result
@@ -895,18 +1007,24 @@ class Jellyfin:
         people = list(item.get("People") or [])
         changed = False
 
-        existing = {
-            (
-                str(person.get("Name") or "").casefold(),
-                str(person.get("Type") or "").casefold(),
-            )
-            for person in people
-        }
-
         for composer in composers:
-            key = (composer.casefold(), "composer")
+            composer_key = composer.casefold()
+            composer_people: list[dict[str, Any]] = []
 
-            if key in existing:
+            for person in people:
+                if (
+                    str(person.get("Name") or "").casefold() == composer_key
+                    and str(person.get("Type") or "").casefold() == "composer"
+                ):
+                    composer_people.append(person)
+
+            if composer_people:
+                # If the relationship exists but Role is missing/wrong,
+                # repair it rather than treating it as complete.
+                for person in composer_people:
+                    if str(person.get("Role") or "").casefold() != "composer":
+                        person["Role"] = "Composer"
+                        changed = True
                 continue
 
             people.append({
@@ -914,14 +1032,104 @@ class Jellyfin:
                 "Role": "Composer",
                 "Type": "Composer",
             })
-
-            existing.add(key)
             changed = True
 
         if changed:
             item["People"] = people
 
         return changed
+
+    @staticmethod
+    def missing_composer_people(
+        item: dict[str, Any],
+        composers: list[str],
+    ) -> list[str]:
+        people = list(item.get("People") or [])
+        present: set[str] = set()
+
+        for person in people:
+            if (
+                str(person.get("Type") or "").casefold() == "composer"
+                and str(person.get("Role") or "").casefold() == "composer"
+            ):
+                name = str(person.get("Name") or "").strip()
+                if name:
+                    present.add(name.casefold())
+
+        return [
+            composer
+            for composer in composers
+            if composer.casefold() not in present
+        ]
+
+    def ensure_item_composers(
+        self,
+        item_id: str,
+        composers: list[str],
+        item_label: str,
+    ) -> tuple[bool, bool]:
+        """
+        Ensure and verify Composer People on one Jellyfin item.
+
+        Returns:
+            (changed, verified)
+        """
+        full_item = self.get_item(item_id)
+        changed = self.merge_composers_into_people(full_item, composers)
+
+        if changed:
+            self.update_item(full_item)
+
+        if self.dry_run:
+            return changed, True
+
+        # Verify by reading the DTO back from Jellyfin. A successful POST
+        # alone is not considered proof that the People relationship stuck.
+        verified_item = self.get_item(item_id)
+        missing = self.missing_composer_people(
+            verified_item,
+            composers,
+        )
+
+        if not missing:
+            return changed, True
+
+        LOG.warning(
+            "Composer verification failed for %s (%s); missing: %s. "
+            "Retrying once.",
+            item_label,
+            item_id,
+            "; ".join(missing),
+        )
+
+        retry_item = self.get_item(item_id)
+        retry_changed = self.merge_composers_into_people(
+            retry_item,
+            composers,
+        )
+
+        if retry_changed:
+            self.update_item(retry_item)
+            changed = True
+
+        time.sleep(0.25)
+
+        verified_item = self.get_item(item_id)
+        missing = self.missing_composer_people(
+            verified_item,
+            composers,
+        )
+
+        if missing:
+            LOG.error(
+                "Composer People did not persist for %s (%s); still missing: %s",
+                item_label,
+                item_id,
+                "; ".join(missing),
+            )
+            return changed, False
+
+        return changed, True
 
     def update_item(self, item: dict[str, Any]) -> None:
         if self.dry_run:
@@ -1012,13 +1220,88 @@ class Jellyfin:
 
         return True
 
-    def scan_library(self) -> None:
+    def get_scan_task(self) -> dict[str, Any] | None:
+        try:
+            tasks = self.request("GET", "/ScheduledTasks").json()
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning("Could not inspect Jellyfin scheduled tasks: %s", exc)
+            return None
+
+        if not isinstance(tasks, list):
+            return None
+
+        for task in tasks:
+            key = str(task.get("Key") or "").casefold()
+            name = str(task.get("Name") or "").casefold()
+
+            if (
+                key == "refreshmedialibrarytask"
+                or name == "scan media library"
+            ):
+                return task
+
+        return None
+
+    def scan_library_and_wait(
+        self,
+        timeout_seconds: int = 1800,
+    ) -> None:
         if self.dry_run:
-            LOG.info("Would request a Jellyfin library scan")
+            LOG.info(
+                "Would request a Jellyfin library scan and wait for completion"
+            )
             return
 
         self.request("POST", "/Library/Refresh")
         LOG.info("Requested Jellyfin library scan")
+
+        deadline = time.monotonic() + timeout_seconds
+        saw_running = False
+        initial_grace_deadline = time.monotonic() + 15
+
+        while time.monotonic() < deadline:
+            task = self.get_scan_task()
+
+            if task is None:
+                LOG.warning(
+                    "Could not identify the Scan Media Library task; "
+                    "waiting 5 seconds before final Composer reconciliation."
+                )
+                time.sleep(5)
+                return
+
+            state = str(task.get("State") or "")
+            progress = task.get("CurrentProgressPercentage")
+
+            if state.casefold() == "running":
+                saw_running = True
+                if progress is not None:
+                    LOG.info(
+                        "Jellyfin library scan running: %s%%",
+                        progress,
+                    )
+
+            elif state.casefold() == "idle":
+                if saw_running:
+                    LOG.info("Jellyfin library scan completed")
+                    return
+
+                if time.monotonic() >= initial_grace_deadline:
+                    # Very small scans can complete before the first poll.
+                    LOG.info(
+                        "Jellyfin scan task is idle after the startup grace "
+                        "period; continuing with final Composer reconciliation."
+                    )
+                    return
+
+            time.sleep(2)
+
+        LOG.warning(
+            "Timed out waiting for Jellyfin library scan after %d seconds; "
+            "continuing with final Composer reconciliation.",
+            timeout_seconds,
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1190,12 +1473,20 @@ def main() -> int:
         ):
             nfo_updates += 1
 
+    # album.nfo is filesystem metadata, so if it changed let Jellyfin ingest
+    # it BEFORE we perform the final track-level People reconciliation.
+    # No library scan is requested after the final relationship writes.
+    if nfo_updates:
+        jellyfin.scan_library_and_wait()
+
     jellyfin.load_audio_items()
     jellyfin.load_album_items()
 
     all_composers: set[str] = set()
     tracks_updated = 0
     tracks_not_found = 0
+    tracks_verified = 0
+    track_verification_failures = 0
 
     for mp3, composers in track_composers.items():
         all_composers.update(composers)
@@ -1213,20 +1504,24 @@ def main() -> int:
             )
             continue
 
-        # Fetch the complete user-scoped DTO before changing People.
-        # Jellyfin metadata updates are not PATCH operations; posting a
-        # partial DTO can fail or unintentionally overwrite fields.
-        full_track_item = jellyfin.get_item(str(item["Id"]))
+        changed, verified = jellyfin.ensure_item_composers(
+            item_id=str(item["Id"]),
+            composers=composers,
+            item_label=str(mp3),
+        )
 
-        if jellyfin.merge_composers_into_people(
-            full_track_item,
-            composers,
-        ):
-            jellyfin.update_item(full_track_item)
+        if changed:
             tracks_updated += 1
+
+        if verified:
+            tracks_verified += 1
+        else:
+            track_verification_failures += 1
 
     albums_updated = 0
     albums_not_found = 0
+    albums_verified = 0
+    album_verification_failures = 0
 
     for album_dir, composers in album_composers.items():
         album_item = jellyfin.find_album_item(album_dir)
@@ -1241,23 +1536,25 @@ def main() -> int:
             )
             continue
 
-        # Fetch the current item before posting an update so we preserve
-        # unrelated album metadata and existing People relationships.
-        full_album_item = jellyfin.get_item(str(album_item["Id"]))
+        changed, verified = jellyfin.ensure_item_composers(
+            item_id=str(album_item["Id"]),
+            composers=sorted(composers, key=str.casefold),
+            item_label=str(album_dir),
+        )
 
-        if jellyfin.merge_composers_into_people(
-            full_album_item,
-            sorted(composers, key=str.casefold),
-        ):
-            jellyfin.update_item(full_album_item)
+        if changed:
             albums_updated += 1
 
-    if tracks_updated or albums_updated:
-        jellyfin.scan_library()
+        if verified:
+            albums_verified += 1
+        else:
+            album_verification_failures += 1
 
-        if not args.dry_run:
-            # Allow Jellyfin a moment to materialize Person records.
-            time.sleep(2)
+    if (tracks_updated or albums_updated) and not args.dry_run:
+        # Give Jellyfin a short moment to create/reuse Person records from
+        # the newly committed People relationships. Do NOT scan the library
+        # here; a scan after this point could rebuild track metadata.
+        time.sleep(2)
 
     biographies_updated = 0
     wikipedia_skipped_existing = 0
@@ -1327,13 +1624,20 @@ def main() -> int:
             biographies_updated += 1
 
     if biographies_updated:
-        jellyfin.scan_library()
+        LOG.info(
+            "Biography updates were posted directly; no library scan is "
+            "requested after final Composer People reconciliation."
+        )
 
     LOG.info(
         "Finished: "
         "%d album.nfo file(s) updated; "
         "%d track(s) updated; "
+        "%d track(s) verified with Composer People; "
+        "%d track Composer verification failure(s); "
         "%d album Composer relationship(s) updated; "
+        "%d album(s) verified with Composer People; "
+        "%d album Composer verification failure(s); "
         "%d new biography/biographies added; "
         "%d existing biography/biographies preserved; "
         "%d Wikipedia lookup(s) had no result; "
@@ -1343,7 +1647,11 @@ def main() -> int:
         "Wikimedia stopped=%s",
         nfo_updates,
         tracks_updated,
+        tracks_verified,
+        track_verification_failures,
         albums_updated,
+        albums_verified,
+        album_verification_failures,
         biographies_updated,
         wikipedia_skipped_existing,
         wikipedia_not_found,
