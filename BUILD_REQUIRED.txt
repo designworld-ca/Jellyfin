@@ -1,0 +1,14 @@
+Composer Shared Metadata v1.2.3 — SOURCE ONLY
+
+This ZIP is not a precompiled Jellyfin plugin installer. It is the complete
+source tree needed for a Linux x64 build of Jellyfin 12.2/.NET 10.
+
+To produce an installable ZIP, merge into the Composer_Metadata GitHub repo,
+then run Build native Composer plugin and Publish Composer repository manifest.
+
+This release fixes the missing Microsoft.Data.Sqlite 10.0.13.0 assembly failure
+by including all managed SQLite DLLs in meta.json.assemblies, verifying the
+published DLL identities using .NET, and checking the compiled release ZIP.
+
+Plugin GUID and SQLite database schema remain unchanged. No database migration.
+Composer Browser v3.7.2 is included, unchanged. Do not overwrite live SQLite DBs.
